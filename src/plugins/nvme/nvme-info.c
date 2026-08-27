@@ -389,17 +389,45 @@ static guint64 int128_to_guint64 (__u8 data[16])
     return result;
 }
 
-gint _open_dev (const gchar *device, GError **error) {
+bd_nvme_dev_t _open_dev (const gchar *device, GError **error) {
+#ifdef HAVE_LIBNVME3
+    struct libnvme_global_ctx *ctx;
+    struct libnvme_transport_handle *hdl = NULL;
+    const gchar *devname;
+    int ret;
+
+    devname = device;
+    if (g_str_has_prefix (devname, "/dev/"))
+        devname += 5;
+
+    ctx = libnvme_create_global_ctx ();
+    if (!ctx) {
+        g_set_error (error, BD_NVME_ERROR, BD_NVME_ERROR_FAILED,
+                     "Failed to create libnvme context");
+        return BD_NVME_DEV_INVALID;
+    }
+
+    ret = libnvme_open (ctx, devname, O_RDONLY, &hdl);
+    libnvme_free_global_ctx (ctx);
+    if (ret != 0) {
+        _nvme_status_to_error (-1, FALSE, error);
+        g_prefix_error (error, "Failed to open device '%s': ", device);
+        return BD_NVME_DEV_INVALID;
+    }
+
+    return hdl;
+#else
     int fd;
 
     fd = open (device, O_RDONLY);
     if (fd < 0) {
         _nvme_status_to_error (-1, FALSE, error);
         g_prefix_error (error, "Failed to open device '%s': ", device);
-        return -1;
+        return BD_NVME_DEV_INVALID;
     }
 
     return fd;
+#endif
 }
 
 /* backported from nvme-cli: https://github.com/linux-nvme/nvme-cli/pull/2051 */
@@ -469,30 +497,38 @@ static gboolean _nvme_a_is_zero (const __u8 a[], int len) {
  */
 BDNVMEControllerInfo * bd_nvme_get_controller_info (const gchar *device, GError **error) {
     int ret;
-    int fd;
+    bd_nvme_dev_t dev;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     struct nvme_id_ctrl *ctrl_id;
     BDNVMEControllerInfo *info;
 
     /* open the block device */
-    fd = _open_dev (device, error);
-    if (fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return NULL;
 
     ctrl_id = _nvme_alloc (sizeof (struct nvme_id_ctrl), error);
     if (!ctrl_id) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
     /* send the NVME_IDENTIFY_CNS_CTRL ioctl */
-    ret = nvme_identify_ctrl (fd, ctrl_id);
+#ifdef HAVE_LIBNVME3
+    nvme_init_identify_ctrl (&cmd, ctrl_id);
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    ret = nvme_identify_ctrl (dev, ctrl_id);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Identify Controller command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (ctrl_id);
         return NULL;
     }
-    close (fd);
+    _libnvme_close (dev);
 
     info = g_new0 (BDNVMEControllerInfo, 1);
     if ((ctrl_id->cmic & NVME_CTRL_CMIC_MULTI_PORT) == NVME_CTRL_CMIC_MULTI_PORT)
@@ -595,7 +631,10 @@ BDNVMENamespaceInfo *bd_nvme_get_namespace_info (const gchar *device, GError **e
     int ret_ctrl;
     int ret_desc = -1;
     int ret_ns_ind = -1;
-    int fd;
+    bd_nvme_dev_t dev;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     __u32 nsid = 0;
     struct nvme_id_ctrl *ctrl_id;
     struct nvme_id_ns *ns_info;
@@ -609,30 +648,39 @@ BDNVMENamespaceInfo *bd_nvme_get_namespace_info (const gchar *device, GError **e
     GPtrArray *ptr_array;
 
     /* open the block device */
-    fd = _open_dev (device, error);
-    if (fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return NULL;
 
     /* get Namespace Identifier (NSID) for the @device (NVME_IOCTL_ID) */
-    ret = nvme_get_nsid (fd, &nsid);
+#ifdef HAVE_LIBNVME3
+    ret = libnvme_get_nsid (dev, &nsid);
+#else
+    ret = nvme_get_nsid (dev, &nsid);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "Error getting Namespace Identifier (NSID): ");
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
 
     /* send the NVME_IDENTIFY_CNS_NS ioctl */
     ns_info = _nvme_alloc (sizeof (struct nvme_id_ns), error);
     if (!ns_info) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
-    ret = nvme_identify_ns (fd, nsid, ns_info);
+#ifdef HAVE_LIBNVME3
+    nvme_init_identify_ns (&cmd, nsid, ns_info);
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    ret = nvme_identify_ns (dev, nsid, ns_info);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Identify Namespace command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (ns_info);
         return NULL;
     }
@@ -640,26 +688,43 @@ BDNVMENamespaceInfo *bd_nvme_get_namespace_info (const gchar *device, GError **e
     /* send the NVME_IDENTIFY_CNS_CTRL ioctl */
     ctrl_id = _nvme_alloc (sizeof (struct nvme_id_ctrl), error);
     if (!ctrl_id) {
-        close (fd);
+        _libnvme_close (dev);
         free (ns_info);
         return NULL;
     }
-    ret_ctrl = nvme_identify_ctrl (fd, ctrl_id);
+#ifdef HAVE_LIBNVME3
+    nvme_init_identify_ctrl (&cmd, ctrl_id);
+    ret_ctrl = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    ret_ctrl = nvme_identify_ctrl (dev, ctrl_id);
+#endif
 
     /* send the NVME_IDENTIFY_CNS_NS_DESC_LIST ioctl, NVMe 1.3 */
     if (ret_ctrl == 0 && GUINT32_FROM_LE (ctrl_id->ver) >= 0x10300) {
         descs = _nvme_alloc (NVME_IDENTIFY_DATA_SIZE, NULL);
-        if (descs != NULL)
-            ret_desc = nvme_identify_ns_descs (fd, nsid, descs);
+        if (descs != NULL) {
+#ifdef HAVE_LIBNVME3
+            nvme_init_identify_ns_descs_list (&cmd, nsid, descs);
+            ret_desc = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+            ret_desc = nvme_identify_ns_descs (dev, nsid, descs);
+#endif
+        }
     }
 
     /* send the NVME_IDENTIFY_CNS_CSI_INDEPENDENT_ID_NS ioctl, NVMe 2.0 */
     if (ret_ctrl == 0 && GUINT32_FROM_LE (ctrl_id->ver) >= 0x20000) {
         ns_info_ind = _nvme_alloc (sizeof (struct nvme_id_independent_id_ns), NULL);
-        if (ns_info_ind != NULL)
-            ret_ns_ind = nvme_identify_independent_identify_ns (fd, nsid, ns_info_ind);
+        if (ns_info_ind != NULL) {
+#ifdef HAVE_LIBNVME3
+            nvme_init_identify_csi_independent_identify_id_ns (&cmd, nsid, ns_info_ind);
+            ret_ns_ind = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+            ret_ns_ind = nvme_identify_independent_identify_ns (dev, nsid, ns_info_ind);
+#endif
+        }
     }
-    close (fd);
+    _libnvme_close (dev);
 
     info = g_new0 (BDNVMENamespaceInfo, 1);
     info->nsid = nsid;
@@ -764,28 +829,36 @@ BDNVMENamespaceInfo *bd_nvme_get_namespace_info (const gchar *device, GError **e
 BDNVMESmartLog * bd_nvme_get_smart_log (const gchar *device, GError **error) {
     int ret;
     int ret_identify;
-    int fd;
+    bd_nvme_dev_t dev;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     struct nvme_id_ctrl *ctrl_id;
     struct nvme_smart_log *smart_log;
     BDNVMESmartLog *log;
     guint i;
 
     /* open the block device */
-    fd = _open_dev (device, error);
-    if (fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return NULL;
 
     /* send the NVME_IDENTIFY_CNS_CTRL ioctl */
     ctrl_id = _nvme_alloc (sizeof (struct nvme_id_ctrl), error);
     if (!ctrl_id) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
-    ret_identify = nvme_identify_ctrl (fd, ctrl_id);
+#ifdef HAVE_LIBNVME3
+    nvme_init_identify_ctrl (&cmd, ctrl_id);
+    ret_identify = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    ret_identify = nvme_identify_ctrl (dev, ctrl_id);
+#endif
     if (ret_identify != 0) {
         _nvme_status_to_error (ret_identify, FALSE, error);
         g_prefix_error (error, "NVMe Identify Controller command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (ctrl_id);
         return NULL;
     }
@@ -793,20 +866,25 @@ BDNVMESmartLog * bd_nvme_get_smart_log (const gchar *device, GError **error) {
     /* send the NVME_LOG_LID_SMART ioctl */
     smart_log = _nvme_alloc (sizeof (struct nvme_smart_log), error);
     if (!smart_log) {
-        close (fd);
+        _libnvme_close (dev);
         free (ctrl_id);
         return NULL;
     }
-    ret = nvme_get_log_smart (fd, NVME_NSID_ALL, FALSE /* rae */, smart_log);
+#ifdef HAVE_LIBNVME3
+    nvme_init_get_log_smart (&cmd, NVME_NSID_ALL, smart_log);
+    ret = libnvme_get_log (dev, &cmd, FALSE /* rae */, 0);
+#else
+    ret = nvme_get_log_smart (dev, NVME_NSID_ALL, FALSE /* rae */, smart_log);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Get Log Page - SMART / Health Information Log command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (ctrl_id);
         free (smart_log);
         return NULL;
     }
-    close (fd);
+    _libnvme_close (dev);
 
     log = g_new0 (BDNVMESmartLog, 1);
     if ((smart_log->critical_warning & NVME_SMART_CRIT_SPARE) == NVME_SMART_CRIT_SPARE)
@@ -875,7 +953,10 @@ BDNVMESmartLog * bd_nvme_get_smart_log (const gchar *device, GError **error) {
  */
 BDNVMEErrorLogEntry ** bd_nvme_get_error_log_entries (const gchar *device, GError **error) {
     int ret;
-    int fd;
+    bd_nvme_dev_t dev;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     guint elpe;
     struct nvme_id_ctrl *ctrl_id;
     struct nvme_error_log_page *err_log;
@@ -883,21 +964,26 @@ BDNVMEErrorLogEntry ** bd_nvme_get_error_log_entries (const gchar *device, GErro
     guint i;
 
     /* open the block device */
-    fd = _open_dev (device, error);
-    if (fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return NULL;
 
     /* find out the maximum number of error log entries as reported by the controller */
     ctrl_id = _nvme_alloc (sizeof (struct nvme_id_ctrl), error);
     if (!ctrl_id) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
-    ret = nvme_identify_ctrl (fd, ctrl_id);
+#ifdef HAVE_LIBNVME3
+    nvme_init_identify_ctrl (&cmd, ctrl_id);
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    ret = nvme_identify_ctrl (dev, ctrl_id);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Identify Controller command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (ctrl_id);
         return NULL;
     }
@@ -908,18 +994,23 @@ BDNVMEErrorLogEntry ** bd_nvme_get_error_log_entries (const gchar *device, GErro
     /* send the NVME_LOG_LID_ERROR ioctl */
     err_log = _nvme_alloc (sizeof (struct nvme_error_log_page) * elpe, error);
     if (!err_log) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
-    ret = nvme_get_log_error (fd, elpe, FALSE /* rae */, err_log);
+#ifdef HAVE_LIBNVME3
+    nvme_init_get_log_error (&cmd, elpe, err_log);
+    ret = libnvme_get_log (dev, &cmd, FALSE /* rae */, 0);
+#else
+    ret = nvme_get_log_error (dev, elpe, FALSE /* rae */, err_log);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Get Log Page - Error Information Log Entry command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (err_log);
         return NULL;
     }
-    close (fd);
+    _libnvme_close (dev);
 
     /* parse the log */
     ptr_array = g_ptr_array_new ();
@@ -963,32 +1054,40 @@ BDNVMEErrorLogEntry ** bd_nvme_get_error_log_entries (const gchar *device, GErro
  */
 BDNVMESelfTestLog * bd_nvme_get_self_test_log (const gchar *device, GError **error) {
     int ret;
-    int fd;
+    bd_nvme_dev_t dev;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     struct nvme_self_test_log *self_test_log;
     BDNVMESelfTestLog *log;
     GPtrArray *ptr_array;
     guint i;
 
     /* open the block device */
-    fd = _open_dev (device, error);
-    if (fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return NULL;
 
     /* send the NVME_LOG_LID_DEVICE_SELF_TEST ioctl */
     self_test_log = _nvme_alloc (sizeof (struct nvme_self_test_log), error);
     if (!self_test_log) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
-    ret = nvme_get_log_device_self_test (fd, self_test_log);
+#ifdef HAVE_LIBNVME3
+    nvme_init_get_log_device_self_test (&cmd, self_test_log);
+    ret = libnvme_get_log (dev, &cmd, FALSE, 0);
+#else
+    ret = nvme_get_log_device_self_test (dev, self_test_log);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Get Log Page - Device Self-test Log command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (self_test_log);
         return NULL;
     }
-    close (fd);
+    _libnvme_close (dev);
 
     log = g_new0 (BDNVMESelfTestLog, 1);
     switch (self_test_log->current_operation & NVME_ST_CURR_OP_MASK) {
@@ -1111,31 +1210,39 @@ BDNVMESelfTestLog * bd_nvme_get_self_test_log (const gchar *device, GError **err
  */
 BDNVMESanitizeLog * bd_nvme_get_sanitize_log (const gchar *device, GError **error) {
     int ret;
-    int fd;
+    bd_nvme_dev_t dev;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     struct nvme_sanitize_log_page *sanitize_log;
     BDNVMESanitizeLog *log;
     __u16 sstat;
 
     /* open the block device */
-    fd = _open_dev (device, error);
-    if (fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return NULL;
 
     /* send the NVME_LOG_LID_SANITIZE ioctl */
     sanitize_log = _nvme_alloc (sizeof (struct nvme_sanitize_log_page), error);
     if (!sanitize_log) {
-        close (fd);
+        _libnvme_close (dev);
         return NULL;
     }
-    ret = nvme_get_log_sanitize (fd, FALSE /* rae */, sanitize_log);
+#ifdef HAVE_LIBNVME3
+    nvme_init_get_log_sanitize (&cmd, sanitize_log);
+    ret = libnvme_get_log (dev, &cmd, FALSE /* rae */, 0);
+#else
+    ret = nvme_get_log_sanitize (dev, FALSE /* rae */, sanitize_log);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Get Log Page - Sanitize Status Log command error: ");
-        close (fd);
+        _libnvme_close (dev);
         free (sanitize_log);
         return NULL;
     }
-    close (fd);
+    _libnvme_close (dev);
 
     log = g_new0 (BDNVMESanitizeLog, 1);
     log->sanitize_progress = 0;

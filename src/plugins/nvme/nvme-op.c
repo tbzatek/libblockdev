@@ -57,25 +57,32 @@
  */
 gboolean bd_nvme_device_self_test (const gchar *device, BDNVMESelfTestAction action, GError **error) {
     int ret;
+    bd_nvme_dev_t dev;
+    __u32 nsid = 0xffffffff;
+    enum nvme_dst_stc stc;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#else
     struct nvme_dev_self_test_args args = {
         .args_size = sizeof(args),
         .result = NULL,
         .timeout = NVME_DEFAULT_IOCTL_TIMEOUT,
         .nsid = 0xffffffff,
     };
+#endif
 
     switch (action) {
         case BD_NVME_SELF_TEST_ACTION_SHORT:
-            args.stc = NVME_DST_STC_SHORT;
+            stc = NVME_DST_STC_SHORT;
             break;
         case BD_NVME_SELF_TEST_ACTION_EXTENDED:
-            args.stc = NVME_DST_STC_LONG;
+            stc = NVME_DST_STC_LONG;
             break;
         case BD_NVME_SELF_TEST_ACTION_VENDOR_SPECIFIC:
-            args.stc = NVME_DST_STC_VS;
+            stc = NVME_DST_STC_VS;
             break;
         case BD_NVME_SELF_TEST_ACTION_ABORT:
-            args.stc = NVME_DST_STC_ABORT;
+            stc = NVME_DST_STC_ABORT;
             break;
         default:
             g_set_error (error, BD_NVME_ERROR, BD_NVME_ERROR_INVALID_ARGUMENT,
@@ -84,38 +91,53 @@ gboolean bd_nvme_device_self_test (const gchar *device, BDNVMESelfTestAction act
     }
 
     /* open the block device */
-    args.fd = _open_dev (device, error);
-    if (args.fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return FALSE;
 
     /* get Namespace Identifier (NSID) for the @device (NVME_IOCTL_ID) */
-    ret = nvme_get_nsid (args.fd, &args.nsid);
+#ifdef HAVE_LIBNVME3
+    ret = libnvme_get_nsid (dev, &nsid);
+#else
+    ret = nvme_get_nsid (dev, &nsid);
+#endif
     if (ret < 0 && errno == ENOTTY)
         /* not a block device, assuming controller character device */
-        args.nsid = 0xffffffff;
+        nsid = 0xffffffff;
     else if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "Error getting Namespace Identifier (NSID): ");
-        close (args.fd);
+        _libnvme_close (dev);
         return FALSE;
     }
 
+#ifdef HAVE_LIBNVME3
+    nvme_init_dev_self_test (&cmd, nsid, stc);
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    args.fd = dev;
+    args.nsid = nsid;
+    args.stc = stc;
     ret = nvme_dev_self_test (&args);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Device Self-test command error: ");
-        close (args.fd);
+        _libnvme_close (dev);
         return FALSE;
     }
-    close (args.fd);
+    _libnvme_close (dev);
 
     return TRUE;
 }
 
 
 /* returns 0xff in case of error (the NVMe standard defines total of 16 flba records) */
-static __u8 find_lbaf_for_size (int fd, __u32 nsid, guint16 lba_data_size, guint16 metadata_size, GError **error) {
+static __u8 find_lbaf_for_size (bd_nvme_dev_t dev, __u32 nsid, guint16 lba_data_size, guint16 metadata_size, GError **error) {
     int ret;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#endif
     struct nvme_id_ns *ns_info;
     __u8 flbas = 0;
     guint i;
@@ -124,7 +146,12 @@ static __u8 find_lbaf_for_size (int fd, __u32 nsid, guint16 lba_data_size, guint
     ns_info = _nvme_alloc (sizeof (struct nvme_id_ns), error);
     if (!ns_info)
         return 0xff;
-    ret = nvme_identify_ns (fd, nsid == 0xffffffff ? 1 : nsid, ns_info);
+#ifdef HAVE_LIBNVME3
+    nvme_init_identify_ns (&cmd, nsid == 0xffffffff ? 1 : nsid, ns_info);
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    ret = nvme_identify_ns (dev, nsid == 0xffffffff ? 1 : nsid, ns_info);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "NVMe Identify Namespace command error: ");
@@ -183,8 +210,15 @@ static __u8 find_lbaf_for_size (int fd, __u32 nsid, guint16 lba_data_size, guint
  */
 gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 metadata_size, BDNVMEFormatSecureErase secure_erase, GError **error) {
     int ret;
+    bd_nvme_dev_t dev;
+    __u32 nsid = 0xffffffff;
+    __u8 lbaf;
     gboolean ctrl_device = FALSE;
     struct nvme_id_ctrl *ctrl_id;
+    enum nvme_cmd_format_ses ses;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#else
     struct nvme_format_nvm_args args = {
         .args_size = sizeof(args),
         .result = NULL,
@@ -195,21 +229,26 @@ gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 met
         .pil = NVME_FORMAT_PIL_LAST /* 0 */,
         .ses = NVME_FORMAT_SES_NONE,
     };
+#endif
 
     /* open the block device */
-    args.fd = _open_dev (device, error);
-    if (args.fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return FALSE;
 
-    ret = nvme_get_nsid (args.fd, &args.nsid);
+#ifdef HAVE_LIBNVME3
+    ret = libnvme_get_nsid (dev, &nsid);
+#else
+    ret = nvme_get_nsid (dev, &nsid);
+#endif
     if (ret < 0 && errno == ENOTTY) {
         /* not a block device, assuming controller character device */
-        args.nsid = 0xffffffff;
+        nsid = 0xffffffff;
         ctrl_device = TRUE;
     } else if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "Error getting Namespace Identifier (NSID): ");
-        close (args.fd);
+        _libnvme_close (dev);
         return FALSE;
     }
 
@@ -217,14 +256,19 @@ gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 met
     if (! ctrl_device) {
         ctrl_id = _nvme_alloc (sizeof (struct nvme_id_ctrl), error);
         if (!ctrl_id) {
-            close (args.fd);
+            _libnvme_close (dev);
             return FALSE;
         }
-        ret = nvme_identify_ctrl (args.fd, ctrl_id);
+#ifdef HAVE_LIBNVME3
+        nvme_init_identify_ctrl (&cmd, ctrl_id);
+        ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+        ret = nvme_identify_ctrl (dev, ctrl_id);
+#endif
         if (ret != 0) {
             _nvme_status_to_error (ret, FALSE, error);
             g_prefix_error (error, "NVMe Identify Controller command error: ");
-            close (args.fd);
+            _libnvme_close (dev);
             free (ctrl_id);
             return FALSE;
         }
@@ -238,7 +282,7 @@ gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 met
              * should be called on a controller device instead */
             g_set_error_literal (error, BD_NVME_ERROR, BD_NVME_ERROR_WOULD_FORMAT_ALL_NS,
                                  "The NVMe controller indicates it would format all namespaces.");
-            close (args.fd);
+            _libnvme_close (dev);
             free (ctrl_id);
             return FALSE;
         }
@@ -246,38 +290,53 @@ gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 met
     }
 
     /* find out the desired LBA data format index */
-    args.lbaf = find_lbaf_for_size (args.fd, args.nsid, lba_data_size, metadata_size, error);
-    if (args.lbaf == 0xff) {
-        close (args.fd);
+    lbaf = find_lbaf_for_size (dev, nsid, lba_data_size, metadata_size, error);
+    if (lbaf == 0xff) {
+        _libnvme_close (dev);
         return FALSE;
     }
 
     switch (secure_erase) {
         case BD_NVME_FORMAT_SECURE_ERASE_USER_DATA:
-            args.ses = NVME_FORMAT_SES_USER_DATA_ERASE;
+            ses = NVME_FORMAT_SES_USER_DATA_ERASE;
             break;
         case BD_NVME_FORMAT_SECURE_ERASE_CRYPTO:
-            args.ses = NVME_FORMAT_SES_CRYPTO_ERASE;
+            ses = NVME_FORMAT_SES_CRYPTO_ERASE;
             break;
         case BD_NVME_FORMAT_SECURE_ERASE_NONE:
         default:
-            args.ses = NVME_FORMAT_SES_NONE;
+            ses = NVME_FORMAT_SES_NONE;
     }
 
+#ifdef HAVE_LIBNVME3
+    nvme_init_format_nvm (&cmd, nsid, lbaf,
+                          NVME_FORMAT_MSET_SEPARATE, NVME_FORMAT_PI_DISABLE,
+                          NVME_FORMAT_PIL_LAST, ses);
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    args.fd = dev;
+    args.nsid = nsid;
+    args.lbaf = lbaf;
+    args.ses = ses;
     ret = nvme_format_nvm (&args);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "Format NVM command error: ");
-        close (args.fd);
+        _libnvme_close (dev);
         return FALSE;
     }
 
     /* rescan the namespaces if block size has changed */
     if (ctrl_device) {
-        if (ioctl (args.fd, NVME_IOCTL_RESCAN) < 0) {
+#ifdef HAVE_LIBNVME3
+        if (libnvme_rescan_ns (dev) < 0) {
+#else
+        if (ioctl (dev, NVME_IOCTL_RESCAN) < 0) {
+#endif
             g_set_error (error, BD_NVME_ERROR, BD_NVME_ERROR_FAILED,
                          "Failed to rescan namespaces after format: %s", strerror_l (errno, _C_LOCALE));
-            close (args.fd);
+            _libnvme_close (dev);
             return FALSE;
         }
     } else {
@@ -289,23 +348,31 @@ gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 met
              */
             int block_size = lba_data_size;
 
-            if (ioctl (args.fd, BLKBSZSET, &block_size) < 0) {
+#ifdef HAVE_LIBNVME3
+            if (libnvme_update_block_size (dev, block_size) < 0) {
+#else
+            if (ioctl (dev, BLKBSZSET, &block_size) < 0) {
+#endif
                 g_set_error (error, BD_NVME_ERROR, BD_NVME_ERROR_FAILED,
                              "Failed to set block size to %d after format: %s", block_size, strerror_l (errno, _C_LOCALE));
-                close (args.fd);
+                _libnvme_close (dev);
                 return FALSE;
             }
 
-            if (ioctl (args.fd, BLKRRPART) < 0) {
+#ifdef HAVE_LIBNVME3
+            if (ioctl (libnvme_transport_handle_get_fd (dev), BLKRRPART) < 0) {
+#else
+            if (ioctl (dev, BLKRRPART) < 0) {
+#endif
                 g_set_error (error, BD_NVME_ERROR, BD_NVME_ERROR_FAILED,
                              "Failed to re-read partition table after format: %s", strerror_l (errno, _C_LOCALE));
-                close (args.fd);
+                _libnvme_close (dev);
                 return FALSE;
             }
         }
     }
 
-    close (args.fd);
+    _libnvme_close (dev);
     return TRUE;
 }
 
@@ -355,6 +422,11 @@ gboolean bd_nvme_format (const gchar *device, guint16 lba_data_size, guint16 met
  */
 gboolean bd_nvme_sanitize (const gchar *device, BDNVMESanitizeAction action, gboolean no_dealloc, gint overwrite_pass_count, guint32 overwrite_pattern, gboolean overwrite_invert_pattern, GError **error) {
     int ret;
+    bd_nvme_dev_t dev;
+    enum nvme_sanitize_sanact sanact;
+#ifdef HAVE_LIBNVME3
+    struct libnvme_passthru_cmd cmd;
+#else
     struct nvme_sanitize_nvm_args args = {
         .args_size = sizeof(args),
         .result = NULL,
@@ -365,19 +437,20 @@ gboolean bd_nvme_sanitize (const gchar *device, BDNVMESanitizeAction action, gbo
         .nodas = no_dealloc,
         .ovrpat = GUINT32_TO_LE (overwrite_pattern),
     };
+#endif
 
     switch (action) {
         case BD_NVME_SANITIZE_ACTION_EXIT_FAILURE:
-            args.sanact = NVME_SANITIZE_SANACT_EXIT_FAILURE;
+            sanact = NVME_SANITIZE_SANACT_EXIT_FAILURE;
             break;
         case BD_NVME_SANITIZE_ACTION_BLOCK_ERASE:
-            args.sanact = NVME_SANITIZE_SANACT_START_BLOCK_ERASE;
+            sanact = NVME_SANITIZE_SANACT_START_BLOCK_ERASE;
             break;
         case BD_NVME_SANITIZE_ACTION_OVERWRITE:
-            args.sanact = NVME_SANITIZE_SANACT_START_OVERWRITE;
+            sanact = NVME_SANITIZE_SANACT_START_OVERWRITE;
             break;
         case BD_NVME_SANITIZE_ACTION_CRYPTO_ERASE:
-            args.sanact = NVME_SANITIZE_SANACT_START_CRYPTO_ERASE;
+            sanact = NVME_SANITIZE_SANACT_START_CRYPTO_ERASE;
             break;
         default:
             g_set_error (error, BD_NVME_ERROR, BD_NVME_ERROR_INVALID_ARGUMENT,
@@ -386,18 +459,27 @@ gboolean bd_nvme_sanitize (const gchar *device, BDNVMESanitizeAction action, gbo
     }
 
     /* open the block device */
-    args.fd = _open_dev (device, error);
-    if (args.fd < 0)
+    dev = _open_dev (device, error);
+    if (!BD_NVME_DEV_IS_VALID (dev))
         return FALSE;
 
+#ifdef HAVE_LIBNVME3
+    nvme_init_sanitize_nvm (&cmd, sanact, TRUE, overwrite_pass_count,
+                            overwrite_invert_pattern, no_dealloc, FALSE, FALSE,
+                            GUINT32_TO_LE (overwrite_pattern));
+    ret = libnvme_exec_admin_passthru (dev, &cmd);
+#else
+    args.fd = dev;
+    args.sanact = sanact;
     ret = nvme_sanitize_nvm (&args);
+#endif
     if (ret != 0) {
         _nvme_status_to_error (ret, FALSE, error);
         g_prefix_error (error, "Sanitize command error: ");
-        close (args.fd);
+        _libnvme_close (dev);
         return FALSE;
     }
 
-    close (args.fd);
+    _libnvme_close (dev);
     return TRUE;
 }

@@ -279,9 +279,14 @@ AS_IF([test "x$with_nvdimm" != "xno"],
       [])
 
 AS_IF([test "x$with_nvme" != "xno"],
-      [LIBBLOCKDEV_PKG_CHECK_MODULES([NVME], [libnvme >= 1.3])
-      AS_IF([$PKG_CONFIG --atleast-version=1.4 libnvme],
-            [AC_DEFINE([HAVE_LIBNVME_1_4])], [])
+      [AS_IF([$PKG_CONFIG --exists libnvme3],
+             [LIBBLOCKDEV_PKG_CHECK_MODULES([NVME], [libnvme3])
+              AC_DEFINE([HAVE_LIBNVME3], [1], [Define if libnvme3 is available])
+             ],
+             [LIBBLOCKDEV_PKG_CHECK_MODULES([NVME], [libnvme >= 1.3])
+              AS_IF([$PKG_CONFIG --atleast-version=1.4 libnvme],
+                    [AC_DEFINE([HAVE_LIBNVME_1_4])], [])
+             ])
       ],
       [])
 
